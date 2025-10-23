@@ -30,7 +30,9 @@ from unittest.mock import patch
 from datasets import load_dataset
 from torch.utils.tensorboard import SummaryWriter
 import re
+import ast
 from dotenv import load_dotenv
+load_dotenv()
 load_dotenv()
 
 logging.getLogger("vllm.engine.scheduler").setLevel(logging.ERROR)
@@ -164,7 +166,6 @@ def _validate_numbers(equation_str: str, available_numbers: List[int]) -> bool:
     """
     ### YOUR CODE HERE ###
     try:
-        from collections import Counter
         found = re.findall(r"\d+", equation_str)
         if not found:
             return True  # no numbers used -> valid as a (empty) subset
@@ -195,7 +196,6 @@ def _evaluate_equation(equation_str: str) -> float | None:
     equation_str = equation_str.strip()
     if equation_str == "":
         return None
-    import ast
     allowed_nodes = (
         ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Expr, ast.Load,
         ast.Add, ast.Sub, ast.Mult, ast.Div, ast.USub, ast.UAdd, ast.Mod, ast.Pow
@@ -237,7 +237,7 @@ def reward_fn(generated_text: str, ground_truth: Dict) -> float:
     ans = _extract_answer(generated_text)
     if ans is None:
         return 0.0
-    #Check numbers first
+    # Check numbers first
     numbers = ground_truth.get("numbers", [])
     target = ground_truth.get("target")
     if not _validate_numbers(ans, numbers):
@@ -396,7 +396,7 @@ def compute_group_normalized_advantages(
     adv = rewards_2d - group_means
     # 5. normalize by std if needed
     if normalize_by_std:
-        grou_std = rewards_2d.std(dim=1, unbiased=False, keepdim=True)
+        group_std = rewards_2d.std(dim=1, unbiased=False, keepdim=True)
         adv = adv / (group_std + advantage_eps)
     # 6. flatten
     advantages = adv.view(-1)
@@ -451,8 +451,6 @@ def compute_loss(
     }
     return loss_per_token, metadata
     ### END YOUR CODE ###
-
-    return loss
 
 # ==============================================================================
 # TASK 5: masked mean for grpo and dr-grpo
