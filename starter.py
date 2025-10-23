@@ -38,6 +38,7 @@ load_dotenv()
 logging.getLogger("vllm.engine.scheduler").setLevel(logging.ERROR)
 os.environ["VLLM_USE_V1"] = "1"
 
+from collections import Counter
 
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -58,25 +59,38 @@ For example, numbers = [1, 2, 3, 4] and target = 5, the answer is <answer>(1 + 2
 # vLLM utilities
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85) -> LLM:
     vllm_set_random_seed(seed)
-    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None,
+    # Use only public, stable args; avoid internal patches.
+    return LLM(
+        model=model_id,
+        dtype=torch.bfloat16,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=2048,
     )
-    with world_size_patch, profiling_patch:
-        return LLM(
-            model=model_id,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=2048
-        )
 
 
-def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM) -> None:
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
+def load_policy_into_vllm_instance(policy: PreTrainedModel, tokenizer: AutoTokenizer, seed: int, gpu_memory_utilization: float = 0.4) -> LLM:
+    """
+    Sync the current HF policy to vLLM using a public API workflow:
+    - Save the HF model and tokenizer to a temporary directory
+    - Initialize a fresh vLLM LLM instance pointing at that directory
+    This avoids relying on internal attributes and works across vLLM versions.
+    """
+    tmp_dir = os.path.join("./output", "tmp_vllm_sync")
+    os.makedirs(tmp_dir, exist_ok=True)
+    # Save weights and tokenizer for vLLM to load
+    policy.save_pretrained(tmp_dir)
+    tokenizer.save_pretrained(tmp_dir)
+    # Initialize a new LLM from the saved directory
+    vllm_set_random_seed(seed)
+    synced_llm = LLM(
+        model=tmp_dir,
+        dtype=torch.bfloat16,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_num_seqs=192,
+    )
+    return synced_llm
 
 
 def init_sampling_params(temperature: float, min_tokens: int, max_tokens: int) -> SamplingParams:
@@ -263,7 +277,7 @@ def evaluate_model(llm: LLM, sampling_params: SamplingParams, eval_prompts: List
         reward_value = reward_fn(response_text, gt)
         equation = _extract_answer(response_text)
         result = _evaluate_equation(equation) if equation is not None else None
-        output_tokens = len(llm.llm_engine.tokenizer.encode(response_text))
+        output_tokens = len(llm.get_tokenizer().encode(response_text))
         output_token_lengths.append(output_tokens)
         examples.append({
             "prompt": rollout.prompt, "response": response_text, "answer": gt, "equation": equation,
@@ -495,8 +509,9 @@ def duplicate_data(arr: List, group_size: int) -> List:
     return [x for x in arr for _ in range(group_size)]
 
 
-def rollout_with_vllm(policy: PreTrainedModel, llm: LLM, sampling_params: SamplingParams, prompts_batch: List[str], group_size: int) -> Tuple[List[str], List[str], List[int]]:
-    load_policy_into_vllm_instance(policy, llm)
+def rollout_with_vllm(policy: PreTrainedModel, tokenizer: AutoTokenizer, sampling_params: SamplingParams, prompts_batch: List[str], group_size: int, *, seed: int, gpu_memory_utilization: float = 0.4) -> Tuple[List[str], List[str], List[int]]:
+    # Sync current policy into a fresh vLLM instance
+    llm = load_policy_into_vllm_instance(policy, tokenizer, seed=seed, gpu_memory_utilization=gpu_memory_utilization)
     prompts_dup = duplicate_data(prompts_batch, group_size)
     vllm_rollouts = llm.generate(prompts_dup, sampling_params, use_tqdm=False)
     rollout_input_text, rollout_response_text, rollout_output_tokens = [], [], []
@@ -504,7 +519,7 @@ def rollout_with_vllm(policy: PreTrainedModel, llm: LLM, sampling_params: Sampli
         for r in rollout.outputs:
             rollout_input_text.append(rollout.prompt)
             rollout_response_text.append(r.text)
-            rollout_output_tokens.append(len(llm.llm_engine.tokenizer.encode(r.text)))
+            rollout_output_tokens.append(len(llm.get_tokenizer().encode(r.text)))
     return rollout_input_text, rollout_response_text, rollout_output_tokens
 
 
@@ -554,7 +569,9 @@ def train(
     for _ in range(n_grpo_steps):
         sampled = random.sample(list(zip(train_prompts, train_answers)), n_prompts_per_rollout_batch)
         prompts_batch, answers_batch = [p for p, _ in sampled], [a for _, a in sampled]
-        rollout_input, rollout_response, rollout_tokens = rollout_with_vllm(policy, llm, sampling_params, prompts_batch, group_size)
+        rollout_input, rollout_response, rollout_tokens = rollout_with_vllm(
+            policy, tokenizer, sampling_params, prompts_batch, group_size, seed=seed, gpu_memory_utilization=0.4
+        )
         answers_dup = duplicate_data(answers_batch, group_size)
         avg_output_tokens = sum(rollout_tokens) / len(rollout_tokens) if rollout_tokens else 0.0
         advantages, _, reward_meta = compute_group_normalized_advantages(
@@ -577,7 +594,7 @@ def train(
         rollout_loss /= (rollout_batch_size / micro_train_batch_size)
         train_step += 1
         print(f"Step {train_step} | Loss: {rollout_loss:.4f} | Grad: {grad_norm:.4f} | "
-              f"Reward mean: {reward_meta['mean']:.4f} | Reward std: {reward_meta['std']:.4f}")
+              f"Reward mean: {float(reward_meta['mean']):.4f} | Reward std: {float(reward_meta['std']):.4f}")
         log_train(rollout_loss, grad_norm, reward_meta, avg_output_tokens, writer, train_step)
         if train_step % eval_every == 0:
             metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)

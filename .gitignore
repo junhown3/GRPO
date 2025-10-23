@@ -3,3 +3,31 @@ venv/
 base.py
 base_long.py
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Environment/config
+.env
+.python-version
+
+# Logs and training artifacts
+output/
+*.log
+*.pid
+events.out.tfevents.*
+
+# Temporary vLLM sync dir
+tmp_vllm_sync/
+output/tmp_vllm_sync/
+
+# Not needed in repo
+pip-freeze-before-vllm-pin.txt
+
+# Jupyter
+.ipynb_checkpoints/
