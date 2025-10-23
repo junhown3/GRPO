@@ -11,7 +11,7 @@ from starter import reward_fn
 SEED = 42
 vllm_set_random_seed(SEED)
 
-os.environ["VLLM_USE_V1"] = "0"
+os.environ["VLLM_USE_V1"] = "1"
 
 TEMPLATE = """Using the numbers {numbers}, create an equation that equals {target}.
 You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.

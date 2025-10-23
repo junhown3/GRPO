@@ -34,7 +34,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.getLogger("vllm.engine.scheduler").setLevel(logging.ERROR)
-os.environ["VLLM_USE_V1"] = "0"
+os.environ["VLLM_USE_V1"] = "1"
+
 
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -135,7 +136,14 @@ def _extract_answer(solution_str: str) -> str | None:
         The stripped string content of the last answer tag, or None if no tag is found.
     """
     ### YOUR CODE HERE ###
-    pass
+    try:
+        matches = list(re.finditer(r"<answer>(.*?)</answer>", solution_str, flags=re.DOTALL | re.IGNORECASE))
+        if not matches:
+            return None
+        last = matches[-1].group(1)
+        return last.strip()
+    except Exception:
+        return None
     ### END YOUR CODE ###
 
 
@@ -155,7 +163,21 @@ def _validate_numbers(equation_str: str, available_numbers: List[int]) -> bool:
         True if the equation uses the correct numbers, False otherwise.
     """
     ### YOUR CODE HERE ###
-    pass
+    try:
+        from collections import Counter
+        found = re.findall(r"\d+", equation_str)
+        if not found:
+            return True  # no numbers used -> valid as a (empty) subset
+        found_ints = [int(x) for x in found]
+        found_cnt = Counter(found_ints)
+        avail_cnt = Counter(available_numbers)
+        # each used number must exist in avail and not exceed counts
+        for num, cnt in found_cnt.items():
+            if avail_cnt.get(num, 0) < cnt:
+                return False
+        return True
+    except Exception:
+        return False
     ### END YOUR CODE ###
 
 
@@ -168,8 +190,30 @@ def _evaluate_equation(equation_str: str) -> float | None:
         The result of the equation as a float, or None if it's invalid or unsafe.
     """
     ### YOUR CODE HERE ###
-    pass
+    if equation_str is None:
+        return None
+    equation_str = equation_str.strip()
+    if equation_str == "":
+        return None
+    import ast
+    allowed_nodes = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Expr, ast.Load,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.USub, ast.UAdd, ast.Mod, ast.Pow
+    )
+    try:
+        node = ast.parse(equation_str, mode="eval")
+        for n in ast.walk(node):
+            if not isinstance(n, allowed_nodes):
+                return None
+        # Evaluate using a safe eval of compiled AST
+        compiled = compile(node, "<ast>", "eval")
+        result = eval(compiled, {"__builtins__": {}})
+        return float(result)
+    except Exception:
+        return None
     ### END YOUR CODE ###
+
+
 
 # ==============================================================================
 # TASK 2: Implement the Reward Function
@@ -189,7 +233,25 @@ def reward_fn(generated_text: str, ground_truth: Dict) -> float:
         A float value representing the reward, such as 1.0, 0.1, or 0.0
     """
     ### YOUR CODE HERE ###
-    pass
+    
+    ans = _extract_answer(generated_text)
+    if ans is None:
+        return 0.0
+    #Check numbers first
+    numbers = ground_truth.get("numbers", [])
+    target = ground_truth.get("target")
+    if not _validate_numbers(ans, numbers):
+        return 0.1
+    result = _evaluate_equation(ans)
+    if result is None:
+        return 0.1
+    try:
+        target_f = float(target)
+    except Exception:
+        return 0.1
+    if abs(result - target_f) <= 1e-3:
+        return 1.0
+    return 0.1
     ### END YOUR CODE ###
 
 
@@ -318,7 +380,33 @@ def compute_group_normalized_advantages(
     # 7. Create a `metadata` dictionary with overall statistics of the raw rewards.
     advantages, raw_rewards, metadata = None, None, {}
     ### YOUR CODE HERE ###
-    pass
+    # 1. raw rewards
+    raw = [float(reward_fn(resp, gt)) for resp, gt in zip(rollout_responses, repeated_ground_truths)]
+    raw_rewards = torch.tensor(raw, dtype=torch.float32)
+    if raw_rewards.numel() == 0:
+        advantages = torch.tensor([], dtype=torch.float32)
+        metadata = {"mean": torch.tensor(0.0), "std": torch.tensor(0.0), "max": torch.tensor(0.0), "min": torch.tensor(0.0)}
+        return advantages, raw_rewards, metadata
+    # reshape into (-1, 'groupsize')
+    assert raw_rewards.numel() % group_size == 0, "raw_rewards length must be divisible by group_size"
+    rewards_2d = raw_rewards.view(-1, group_size)
+    # 3. group means
+    group_means = rewards_2d.mean(dim=1, keepdim=True)
+    # 4. advantages = reward - group_mean
+    adv = rewards_2d - group_means
+    # 5. normalize by std if needed
+    if normalize_by_std:
+        grou_std = rewards_2d.std(dim=1, unbiased=False, keepdim=True)
+        adv = adv / (group_std + advantage_eps)
+    # 6. flatten
+    advantages = adv.view(-1)
+    # 7. metadata
+    metadata = {
+        "mean": torch.mean(raw_rewards),
+        "std": torch.std(raw_rewards) if raw_rewards.numel() > 1 else torch.tensor(0.0),
+        "max": torch.max(raw_rewards),
+        "min": torch.min(raw_rewards),
+    }
     ### END YOUR CODE ###
     return advantages, raw_rewards, metadata
 
@@ -349,17 +437,39 @@ def compute_loss(
     """
     loss = 0.0
     ### YOUR CODE HERE ###
-    pass
+    # pi_ratio = exp(policy_log_probs - old_log_probs)
+    pi_ratio = torch.exp(policy_log_probs - old_log_probs)
+    unclipped_term = advantages * pi_ratio
+    clipped_ratio = torch.clamp(pi_ratio, 1.0 - clip_range, 1.0 + clip_range)
+    clipped_term = advantages * clipped_ratio
+    # loss per token
+    loss_per_token = -torch.min(unclipped_term, clipped_term)
+    metadata = {
+        "mean_unclipped": torch.mean(unclipped_term).detach(),
+        "mean_clipped": torch.mean(clipped_term).detach(),
+        "mean_ratio": torch.mean(pi_ratio).detach(),
+    }
+    return loss_per_token, metadata
     ### END YOUR CODE ###
+
     return loss
 
+# ==============================================================================
+# TASK 5: masked mean for grpo and dr-grpo
+# ==============================================================================
 
 def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     Compute the mean of tensor values where mask=True for each row, then average across the batch.
     """
     ### YOUR CODE HERE ###
-    pass
+    tensor = tensor.to(torch.float32)
+    mask = mask.to(torch.bool)
+    # sum per row where mask is True
+    masked_sum = (tensor * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1)
+    row_means = masked_sum / counts
+    return row_means.mean()
     ### END YOUR CODE ###
 
 def masked_mean_drgrpo(tensor: torch.Tensor, mask: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -368,7 +478,11 @@ def masked_mean_drgrpo(tensor: torch.Tensor, mask: torch.Tensor, num_tokens: int
     This is used for the DR-GRPO loss
     """
     ### YOUR CODE HERE ###
-    pass
+    tensor = tensor.to(torch.float32)
+    mask = mask.to(torch.bool)
+    masked_sum = (tensor * mask).sum(dim=1)
+    per_row = masked_sum / float(num_tokens)
+    return per_row.mean()
     ### END YOUR CODE ###
 
 def get_response_log_probs(model: PreTrainedModel, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
