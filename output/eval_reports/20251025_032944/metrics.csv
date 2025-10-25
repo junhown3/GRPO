@@ -1,0 +1,5 @@
+label,model_path,max_tokens,temperature,top_p,num_examples,count_correct,count_partial,count_failed,accuracy,mean_reward
+baseline_zero_shot_L256,Qwen/Qwen3-1.7B,256,1.0,1.0,1024,1,0,1023,0.09765625,0.0009765625
+grpo_finetuned_L256,./output/hw_a2_solution_1761352930,256,1.0,1.0,1024,490,480,54,47.8515625,0.525390625
+baseline_zero_shot_L512,Qwen/Qwen3-1.7B,512,1.0,1.0,1024,142,31,851,13.8671875,0.14169921875
+grpo_finetuned_L512,./output/hw_a2_solution_1761355718,512,1.0,1.0,1024,629,6,389,61.42578125,0.61484375

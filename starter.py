@@ -38,6 +38,13 @@ load_dotenv()
 logging.getLogger("vllm.engine.scheduler").setLevel(logging.ERROR)
 os.environ["VLLM_USE_V1"] = "1"
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 from collections import Counter
 
 from torch.optim.lr_scheduler import LambdaLR
@@ -374,6 +381,46 @@ def evaluate_model_hf(policy: PreTrainedModel, tokenizer: AutoTokenizer, samplin
     }
 
 
+def evaluate_model_vllm(
+    policy: PreTrainedModel,
+    tokenizer: AutoTokenizer,
+    sampling_params: SamplingParams,
+    eval_prompts: List[str],
+    eval_answers: List[Dict],
+    *,
+    seed: int,
+    gpu_memory_utilization: float,
+    max_num_seqs: int | None,
+    max_model_len: int,
+) -> Dict[str, Any]:
+    """Evaluate the current HF policy by mirroring weights into a fresh vLLM instance."""
+
+    torch.cuda.empty_cache()
+    try:
+        llm = load_policy_into_vllm_instance(
+            policy=policy,
+            tokenizer=tokenizer,
+            seed=seed,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+        )
+    except (RuntimeError, ValueError) as exc:
+        warnings.warn(
+            f"Falling back to HF eval because vLLM initialization failed: {exc}"
+        )
+        return evaluate_model_hf(policy, tokenizer, sampling_params, eval_prompts, eval_answers)
+
+    try:
+        metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)
+    finally:
+        try:
+            llm.shutdown()
+        except Exception:
+            pass
+    return metrics
+
+
 def _format_eval_example(example: Dict[str, Any]) -> str:
     target = example["answer"]["target"] if isinstance(example.get("answer"), dict) and "target" in example["answer"] else "?"
     numbers = example["answer"].get("numbers") if isinstance(example.get("answer"), dict) else None
@@ -691,15 +738,30 @@ def train(
     advantage_eps: float, device: str, eval_every: int = 5, writer: SummaryWriter = None, seed: int,
     loss_type: str = "grpo", max_completion_length: int = 256,
     vllm_gpu_memory_utilization: float = 0.4, vllm_max_num_seqs: int | None = None,
-    vllm_max_model_len: int = 2048,
+    vllm_max_model_len: int = 2048, rollout_backend: str = "hf", use_vllm_eval: bool = False,
+    vllm_eval_gpu_memory_utilization: float = 0.6, vllm_eval_max_num_seqs: int | None = None,
+    vllm_eval_max_model_len: int = 2048,
 ) -> None:
     n_prompts_per_rollout_batch = rollout_batch_size // group_size
     micro_train_batch_size = rollout_batch_size // gradient_accumulation_steps
     random.seed(seed)
     train_step = 0
 
-    # Initial eval: use HF generate to avoid duplicating weights on GPU
-    metrics = evaluate_model_hf(policy, tokenizer, sampling_params, eval_prompts, eval_answers)
+    # Initial eval uses the configured backend; vLLM mirrors weights on demand.
+    if use_vllm_eval:
+        metrics = evaluate_model_vllm(
+            policy,
+            tokenizer,
+            sampling_params,
+            eval_prompts,
+            eval_answers,
+            seed=seed,
+            gpu_memory_utilization=vllm_eval_gpu_memory_utilization,
+            max_num_seqs=vllm_eval_max_num_seqs,
+            max_model_len=vllm_eval_max_model_len,
+        )
+    else:
+        metrics = evaluate_model_hf(policy, tokenizer, sampling_params, eval_prompts, eval_answers)
     if writer:
         for k in ["accuracy", "mean_reward", "std_reward", "avg_output_tokens", "count_correct", "count_partial", "count_failed"]:
             writer.add_scalar(f"eval/{k}", metrics[k], global_step=train_step)
@@ -708,9 +770,22 @@ def train(
     for _ in range(n_grpo_steps):
         sampled = random.sample(list(zip(train_prompts, train_answers)), n_prompts_per_rollout_batch)
         prompts_batch, answers_batch = [p for p, _ in sampled], [a for _, a in sampled]
-        rollout_input, rollout_response, rollout_tokens = rollout_with_hf(
-            policy, tokenizer, sampling_params, prompts_batch, group_size,
-        )
+        if rollout_backend.lower() == "vllm":
+            rollout_input, rollout_response, rollout_tokens = rollout_with_vllm(
+                policy,
+                tokenizer,
+                sampling_params,
+                prompts_batch,
+                group_size,
+                seed=seed + train_step,
+                gpu_memory_utilization=vllm_gpu_memory_utilization,
+                max_num_seqs=vllm_max_num_seqs,
+                max_model_len=vllm_max_model_len,
+            )
+        else:
+            rollout_input, rollout_response, rollout_tokens = rollout_with_hf(
+                policy, tokenizer, sampling_params, prompts_batch, group_size,
+            )
         answers_dup = duplicate_data(answers_batch, group_size)
         avg_output_tokens = sum(rollout_tokens) / len(rollout_tokens) if rollout_tokens else 0.0
         advantages, _, reward_meta = compute_group_normalized_advantages(
@@ -736,7 +811,20 @@ def train(
               f"Reward mean: {float(reward_meta['mean']):.4f} | Reward std: {float(reward_meta['std']):.4f}")
         log_train(rollout_loss, grad_norm, reward_meta, avg_output_tokens, writer, train_step)
         if train_step % eval_every == 0:
-            metrics = evaluate_model_hf(policy, tokenizer, sampling_params, eval_prompts, eval_answers)
+            if use_vllm_eval:
+                metrics = evaluate_model_vllm(
+                    policy,
+                    tokenizer,
+                    sampling_params,
+                    eval_prompts,
+                    eval_answers,
+                    seed=seed + train_step,
+                    gpu_memory_utilization=vllm_eval_gpu_memory_utilization,
+                    max_num_seqs=vllm_eval_max_num_seqs,
+                    max_model_len=vllm_eval_max_model_len,
+                )
+            else:
+                metrics = evaluate_model_hf(policy, tokenizer, sampling_params, eval_prompts, eval_answers)
             log_eval(metrics, writer, train_step)
 
 
@@ -745,6 +833,9 @@ def init_policy(model_id: str, device: str) -> Tuple[PreTrainedModel, AutoTokeni
         model_id, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2", use_cache=False
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     model.to(device).train()
     return model, tokenizer
 
@@ -756,11 +847,12 @@ def main() -> None:
     seed = 42
     # Allow env overrides for stability on single GPU
     # Separate GPU memory utilization for eval-time LLM vs rollout-time LLM to avoid contention
-    gpu_mem_util = float(os.getenv("VLLM_MEM_UTIL_EVAL", os.getenv("VLLM_MEM_UTIL", "0.25")))
-    gpu_mem_util_rollout = float(os.getenv("VLLM_MEM_UTIL_ROLLOUT", os.getenv("VLLM_MEM_UTIL", "0.10")))
-    vllm_max_num_seqs = int(os.getenv("VLLM_MAX_NUM_SEQS", "48"))
-    vllm_max_model_len_eval = int(os.getenv("VLLM_MAX_MODEL_LEN_EVAL", "2048"))
-    vllm_max_model_len_rollout = int(os.getenv("VLLM_MAX_MODEL_LEN_ROLLOUT", "1024"))
+    gpu_mem_util_eval = float(os.getenv("VLLM_MEM_UTIL_EVAL", os.getenv("VLLM_MEM_UTIL", "0.20")))
+    gpu_mem_util_rollout = float(os.getenv("VLLM_MEM_UTIL_ROLLOUT", os.getenv("VLLM_MEM_UTIL", "0.80")))
+    vllm_max_num_seqs_eval = int(os.getenv("VLLM_MAX_NUM_SEQS_EVAL", "128"))
+    vllm_max_num_seqs_rollout = int(os.getenv("VLLM_MAX_NUM_SEQS_ROLLOUT", "96"))
+    vllm_max_model_len_eval = int(os.getenv("VLLM_MAX_MODEL_LEN_EVAL", "4096"))
+    vllm_max_model_len_rollout = int(os.getenv("VLLM_MAX_MODEL_LEN_ROLLOUT", "2048"))
     n_grpo_steps = 80
     rollout_batch_size = int(os.getenv("ROLLOUT_BATCH_SIZE", "128"))
     group_size, grad_acc_steps = 8, 32
@@ -771,10 +863,20 @@ def main() -> None:
     # CHANGING HYPERPARAMETERS for main assignment
     loss_type = "grpo" # or "dr_grpo"
     max_tokens = int(os.getenv("MAX_TOKENS", "256")) # or 512, 1024
+    rollout_backend = os.getenv("ROLLOUT_BACKEND", "hf").lower()
+    use_vllm_eval = os.getenv("USE_VLLM_EVAL", "1").lower() in {"1", "true", "yes"}
+    compile_flag = os.getenv("TORCH_COMPILE", "0").lower() in {"1", "true", "yes"}
+    compile_mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
     
     # Initialization
     use_std_norm = loss_type == "grpo"
     policy, tokenizer = init_policy(model_id=model_id, device=device)
+    if compile_flag:
+        try:
+            policy = torch.compile(policy, mode=compile_mode)
+            policy.train()
+        except Exception as compile_exc:
+            warnings.warn(f"torch.compile failed: {compile_exc}")
     sampling_params = init_sampling_params(temperature=temperature, min_tokens=min_tokens, max_tokens=max_tokens)
     
     # Dataset
@@ -817,8 +919,10 @@ def main() -> None:
         use_std_normalization=use_std_norm, advantage_eps=adv_eps, device=device,
         eval_every=eval_every, writer=writer, seed=seed, loss_type=loss_type,
         max_completion_length=max_tokens,
-        vllm_gpu_memory_utilization=gpu_mem_util_rollout, vllm_max_num_seqs=vllm_max_num_seqs,
-        vllm_max_model_len=vllm_max_model_len_rollout,
+        vllm_gpu_memory_utilization=gpu_mem_util_rollout, vllm_max_num_seqs=vllm_max_num_seqs_rollout,
+        vllm_max_model_len=vllm_max_model_len_rollout, rollout_backend=rollout_backend,
+        use_vllm_eval=use_vllm_eval, vllm_eval_gpu_memory_utilization=gpu_mem_util_eval,
+        vllm_eval_max_num_seqs=vllm_max_num_seqs_eval, vllm_eval_max_model_len=vllm_max_model_len_eval,
     )
     
     # Save model

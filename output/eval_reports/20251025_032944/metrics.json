@@ -1,0 +1,54 @@
+[
+  {
+    "label": "baseline_zero_shot_L256",
+    "model_path": "Qwen/Qwen3-1.7B",
+    "max_tokens": 256,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "num_examples": 1024,
+    "count_correct": 1,
+    "count_partial": 0,
+    "count_failed": 1023,
+    "accuracy": 0.09765625,
+    "mean_reward": 0.0009765625
+  },
+  {
+    "label": "grpo_finetuned_L256",
+    "model_path": "./output/hw_a2_solution_1761352930",
+    "max_tokens": 256,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "num_examples": 1024,
+    "count_correct": 490,
+    "count_partial": 480,
+    "count_failed": 54,
+    "accuracy": 47.8515625,
+    "mean_reward": 0.525390625
+  },
+  {
+    "label": "baseline_zero_shot_L512",
+    "model_path": "Qwen/Qwen3-1.7B",
+    "max_tokens": 512,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "num_examples": 1024,
+    "count_correct": 142,
+    "count_partial": 31,
+    "count_failed": 851,
+    "accuracy": 13.8671875,
+    "mean_reward": 0.14169921875
+  },
+  {
+    "label": "grpo_finetuned_L512",
+    "model_path": "./output/hw_a2_solution_1761355718",
+    "max_tokens": 512,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "num_examples": 1024,
+    "count_correct": 629,
+    "count_partial": 6,
+    "count_failed": 389,
+    "accuracy": 61.42578125,
+    "mean_reward": 0.61484375
+  }
+]
