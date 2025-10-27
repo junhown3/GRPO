@@ -6,17 +6,13 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 import torch
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
-from starter import reward_fn
+from GRPO import reward_fn, TEMPLATE
 
 SEED = 42
 vllm_set_random_seed(SEED)
 
 os.environ["VLLM_USE_V1"] = "1"
 
-TEMPLATE = """Using the numbers {numbers}, create an equation that equals {target}.
-You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.
-Show your reasoning in <think> </think> tags. And return the final equation in <answer> </answer> tags. Keep your reasoning under {max_tokens} tokens.
-For example, numbers = [1, 2, 3, 4] and target = 5, the answer is <answer>(1 + 2) * 3 - 4</answer>."""
 
 def is_correct(response: str, target: float, numbers: list) -> bool:
     """Check if response contains correct equation."""

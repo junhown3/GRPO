@@ -1,0 +1,3 @@
+label,model_path,max_tokens,temperature,top_p,num_examples,count_correct,count_partial,count_failed,accuracy,mean_reward
+comp-eff-256,./output/hw_a2_solution_1761539909,256,1.0,1.0,1024,444,63,517,43.359375,0.43974609375
+comp-eff-512,./output/hw_a2_solution_1761539909,512,1.0,1.0,1024,499,130,395,48.73046875,0.5

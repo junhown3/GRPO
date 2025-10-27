@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
-from starter import TEMPLATE, _evaluate_equation, _extract_answer, reward_fn
+from GRPO import TEMPLATE, _evaluate_equation, _extract_answer, reward_fn
 
 
 @dataclass

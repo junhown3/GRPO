@@ -1,0 +1,28 @@
+[
+  {
+    "label": "comp-eff-256",
+    "model_path": "./output/hw_a2_solution_1761539909",
+    "max_tokens": 256,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "num_examples": 1024,
+    "count_correct": 444,
+    "count_partial": 63,
+    "count_failed": 517,
+    "accuracy": 43.359375,
+    "mean_reward": 0.43974609375
+  },
+  {
+    "label": "comp-eff-512",
+    "model_path": "./output/hw_a2_solution_1761539909",
+    "max_tokens": 512,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "num_examples": 1024,
+    "count_correct": 499,
+    "count_partial": 130,
+    "count_failed": 395,
+    "accuracy": 48.73046875,
+    "mean_reward": 0.5
+  }
+]
